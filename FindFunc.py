@@ -9,7 +9,7 @@ import ida_funcs
 import ida_gdl
 import ida_name
 
-regex = r"^\w+::\w+$"
+regex = r"^\w+::\w+"
 plugin_init = False
 
 
@@ -164,62 +164,75 @@ class FindFunc_Plugin_t(idaapi.plugin_t):
 
     def term(self):
         pass
-
-    def fix_str_bs(self, s):
-        if s.endswith("'"):
-            s = s.replace("'", "")
-        if s.startswith("b"):
-            s = s.replace("b", "", 1)
-        s = s.replace("(", "", 1)
-        s = s.replace(")", "", 1)
-        s = s.replace("_", "")
-        s += "_"
-        return s
-
-    def search(self, mod_name, fn_name):
-        imports, res = self.find_import_refs(mod_name)
-        found_strings = list()
+    
+    def assing_unique_name(self, ea, string):
+        string += hex(ea)
+        string = string.replace("0x", "_")
+        return string
+    
+    def cleanup_found_string(self, string):
+        match = re.search(regex, string)
+        if match is not None:
+            string = match.group(0)
+        return string
+    
+    def handle_xrefs(self, import_addr):
+        found_strings = []
         found_addrs = []
+        for xref in idautils.XrefsTo(import_addr):
+            call_addr = xref.frm
+            caller_name = ida_funcs.get_func_name(call_addr)
+            caller_func = ida_funcs.get_func(call_addr)
+
+            if caller_name.startswith("sub_") and caller_func:
+                for ea, ref, string in self.enum_string_refs_in_function(
+                    call_addr
+                ):
+                    if len(string) <= 0 or string is None:
+                        continue
+                    
+                    string = self.cleanup_found_string(string)
+                    match = re.match(regex, string)
+                    
+                    if (
+                        match
+                        and string not in found_strings
+                        and ea not in found_addrs
+                    ):
+                        found_strings.append(string)
+                        found_addrs.append(ea)
+                    elif (
+                        match
+                        and string in found_strings
+                        and ea not in found_addrs
+                    ):
+                        string = self.assing_unique_name(ea, string)
+                        found_strings.append(string)
+                        found_addrs.append(ea)
+        return found_strings, found_addrs
+    
+    def import_parser(self, fn_name, imports, res):
+        xref_strs = []
+        xref_addrs = []
+        
         for key, val in res.items():
             import_name = imports[key][1]
             import_addr = imports[key][0]
-
+            
             if import_name.find(fn_name) >= 0:
-                for xref in idautils.XrefsTo(import_addr):
-                    call_addr = xref.frm
-                    caller_name = ida_funcs.get_func_name(call_addr)
-                    caller_func = ida_funcs.get_func(call_addr)
+                strings, addresses = self.handle_xrefs(import_addr)
+                if strings is None or addresses is None:
+                    continue
+                for (string, addr) in zip(strings, addresses):
+                    xref_strs.append(string)
+                    xref_addrs.append(addr)
+        return xref_strs, xref_addrs
 
-                    if caller_name.startswith("sub_") and caller_func:
-                        for o, r, string in self.enum_string_refs_in_function(
-                            call_addr
-                        ):
-                            if len(string) <= 0:
-                                continue
-
-                            string = self.fix_str_bs(string)
-                            if (
-                                re.match(regex, string)
-                                and string not in found_strings
-                                and caller_func.start_ea not in found_addrs
-                            ):
-                                if string.endswith("_"):
-                                    string = string.replace("_", "")
-                                found_strings.append(string)
-                                found_addrs.append(caller_func.start_ea)
-
-                            elif (
-                                re.match(regex, string)
-                                and string in found_strings
-                                and caller_func.start_ea not in found_addrs
-                            ):
-                                string += hex(caller_func.start_ea)
-                                string = string.replace("0x", "")
-                                found_strings.append(string)
-                                found_addrs.append(caller_func.start_ea)
-
-        if len(found_strings) > 0:
-            c = CustomChooser("FindFunc results", [found_addrs, found_strings])
+    def search(self, mod_name, fn_name):
+        imports, res = self.find_import_refs(mod_name)
+        parsed_data = self.import_parser(fn_name, imports, res)
+        if len(parsed_data) > 0:
+            c = CustomChooser("FindFunc results", [parsed_data[1], parsed_data[0]])
             r = c.show()
             c.set_item_handler(c.AddCommand("Apply Name Change"))
 
@@ -268,11 +281,11 @@ class FindFunc_Plugin_t(idaapi.plugin_t):
     def enum_string_refs_in_function(self, ea):
         for iter_ea in self.enum_func_addr(ea):
             for ref in idautils.DataRefsFrom(iter_ea):
-                type = idc.get_str_type(ref)
-                if type not in range(0, 7) and type != 0x2000001:
+                str_type = idc.get_str_type(ref)
+                if str_type not in range(0, 7) and str_type != 0x2000001:
                     continue
                 CALC_MAX_LEN = -1
-                string = str(idc.get_strlit_contents(ref, CALC_MAX_LEN, type))
+                string = idc.get_strlit_contents(ref, CALC_MAX_LEN, str_type).decode("utf-8")
                 yield iter_ea, ref, string
 
     def run(self, arg):
